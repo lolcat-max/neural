@@ -422,8 +422,9 @@ if __name__ == "__main__":
             cmd = input("SEED: ").strip()
             if not cmd:
                 continue
-            out = generate_words(model, word_to_ix, ix_to_word, cmd, length=120, temp=1229100.2)
+            out = generate_words(model, word_to_ix, ix_to_word, cmd, length=1200, temp=1621229100.2)
             print(f"\n{out}\n")
         except KeyboardInterrupt:
             print("\nExiting.")
             break
+
