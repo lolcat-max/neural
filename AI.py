@@ -65,7 +65,7 @@ def build_vocab_from_xaa(path, vocab_max=8000, min_freq=1):
 
     # keep most common tokens (optionally)
     items = [(w, c) for (w, c) in counts.items() if c >= int(min_freq)]
-    items.sort(key=lambda wc: (-wc[1], wc[0]))
+   
 
     vocab = ["<unk>"]
     if vocab_max is None:
@@ -422,7 +422,7 @@ if __name__ == "__main__":
             cmd = input("SEED: ").strip()
             if not cmd:
                 continue
-            out = generate_words(model, word_to_ix, ix_to_word, cmd, length=1200, temp=1621229100.2)
+            out = generate_words(model, word_to_ix, ix_to_word, cmd, length=1200, temp=0.9)
             print(f"\n{out}\n")
         except KeyboardInterrupt:
             print("\nExiting.")
