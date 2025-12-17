@@ -1,27 +1,20 @@
 import os
-import time
-from collections import Counter
+import requests
 from tqdm import tqdm
 
-import serial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader
 
 # -------------------------
 # Config
 # -------------------------
+KB_len = -1
 CKPT_PATH = "rnn_alt_fgsm_model.pth"
-DATASET_PT_PATH = "analog_xaa_dataset.pt"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Vocab source
-XAA_PATH = "xaa"
-VOCAB_MAX = 8000          # cap vocab to avoid gigantic embedding (set None for unlimited)
-MIN_FREQ = 1
 
 # Model/data hyperparams (saved into checkpoint too)
 SEQ_LEN = 8
@@ -39,142 +32,20 @@ EPS_MAX = 0.30
 EPS_GROW_EVERY = 4
 EPS_GROW_MULT = 1.15
 
-ADV_EVERY = 4
+ADV_EVERY = 4          # 2 => clean, adv, clean, adv...
 EMB_CLAMP = 2.0
 GRAD_CLIP_NORM = 1.0
-
-# Serial
-SERIAL_PORT = "COM3"      # <<< change
-SERIAL_BAUD = 115200
-SERIAL_TIMEOUT_S = 1.0
-SERIAL_NUM_IDS = 300000
-SERIAL_PROGRESS_EVERY = 10000
-
-# Caching
-CACHE_DATASET_PT = True
-
-# -------------------------
-# Vocab from xaa (word labels)
-# -------------------------
-def build_vocab_from_xaa(path, vocab_max=8000, min_freq=1):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        text = f.read().lower()
-
-    words = text.split()
-    counts = Counter(words)
-
-    # keep most common tokens (optionally)
-    items = [(w, c) for (w, c) in counts.items() if c >= int(min_freq)]
-    items.sort(key=lambda wc: (-wc[1], wc[0]))
-
-    vocab = ["<unk>"]
-    if vocab_max is None:
-        vocab.extend([w for (w, _) in items if w != "<unk>"])
-    else:
-        for (w, _) in items:
-            if w == "<unk>":
-                continue
-            vocab.append(w)
-            if len(vocab) >= int(vocab_max):
-                break
-
-    word_to_ix = {w: i for i, w in enumerate(vocab)}
-    ix_to_word = {i: w for w, i in word_to_ix.items()}
-    return word_to_ix, ix_to_word
-
-# -------------------------
-# Serial -> ids tensor
-# -------------------------
-def serial_handshake_and_stream_ids(port, baud, vocab_size, num_ids,
-                                   timeout_s=1.0, progress_every=10000):
-    ser = serial.Serial(port, baud, timeout=timeout_s)
-
-    # reset many Arduino boards by toggling DTR
-    ser.dtr = False
-    time.sleep(0.2)
-    ser.reset_input_buffer()
-    ser.reset_output_buffer()
-    ser.dtr = True
-    time.sleep(1.5)
-
-    # wait for READY (repeats every 500ms in sketch)
-    deadline = time.time() + 10.0
-    ready = False
-    while time.time() < deadline:
-        line = ser.readline().decode(errors="ignore").strip()
-        if line:
-            print("ARDUINO:", line)
-        if line == "READY":
-            ready = True
-            break
-    if not ready:
-        ser.close()
-        raise RuntimeError("No READY from Arduino. Check port/baud, close Serial Monitor, confirm sketch flashed.")
-
-    # ping
-    ser.write(b"PING\n")
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        line = ser.readline().decode(errors="ignore").strip()
-        if line:
-            print("ARDUINO:", line)
-        if line == "PONG":
-            break
-
-    # configure + go
-    ser.write(f"V{int(vocab_size)}\n".encode())
-    ser.write(f"N{int(num_ids)}\n".encode())
-    ser.write(b"GO\n")
-
-    ids = torch.empty((int(num_ids),), dtype=torch.long)
-    got = 0
-    t0 = time.time()
-
-    while got < num_ids:
-        s = ser.readline().decode(errors="ignore").strip()
-        if not s:
-            continue
-
-        if s in ("READY", "PONG", "START") or s.startswith("OK"):
-            continue
-        if s.startswith("ERR"):
-            print("ARDUINO:", s)
-            continue
-        if s == "DONE":
-            break
-
-        try:
-            v = int(s)
-        except ValueError:
-            print("ARDUINO(non-int):", repr(s))
-            continue
-
-        # keep in-range for embedding/classification
-        ids[got] = v % int(vocab_size)
-        got += 1
-
-        if progress_every and got % int(progress_every) == 0:
-            dt = max(1e-6, time.time() - t0)
-            print(f"Serial ids: {got}/{num_ids} ({got/dt:.0f} lines/s)")
-
-    ser.close()
-    return ids[:got].contiguous()
-
-def make_next_token_dataset_from_ids(ids_t, seq_len):
-    L = int(ids_t.numel())
-    if L <= int(seq_len):
-        raise ValueError(f"Need more ids for seq_len={seq_len}: got {L}")
-
-    # X: sliding windows; y: next token
-    X_all = ids_t.unfold(0, int(seq_len), 1)         # (L-seq_len+1, seq_len)
-    X = X_all[: L - int(seq_len)].contiguous()       # (L-seq_len, seq_len)
-    y = ids_t[int(seq_len):].contiguous()            # (L-seq_len,)
-    return TensorDataset(X, y)
 
 # -------------------------
 # Custom non-commutative op: (A @ B)
 # -------------------------
 class NonCommutativeMatMul(torch.autograd.Function):
+    """
+    Explicit autograd for matrix multiplication to emphasize non-commutative backward.
+    For C = A @ B:
+      dL/dA = dL/dC @ B^T
+      dL/dB = A^T @ dL/dC
+    """
     @staticmethod
     def forward(ctx, A, B):
         ctx.save_for_backward(A, B)
@@ -189,7 +60,12 @@ class NonCommutativeMatMul(torch.autograd.Function):
 
 nc_matmul = NonCommutativeMatMul.apply
 
+
 class NCLinear(nn.Module):
+    """
+    Linear layer implemented via nc_matmul so backward order is explicit.
+    Keeps parameter names 'weight'/'bias' to remain checkpoint-friendly with nn.Linear.
+    """
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         self.in_features = int(in_features)
@@ -199,6 +75,7 @@ class NCLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        # Same general init style as nn.Linear
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
         if self.bias is not None:
             fan_in = self.in_features
@@ -206,10 +83,39 @@ class NCLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x):
+        # x: (..., in_features)
+        # weight: (out_features, in_features) => use weight.T for (..., out_features)
         y = nc_matmul(x, self.weight.transpose(-1, -2))
         if self.bias is not None:
             y = y + self.bias
         return y
+
+# -------------------------
+# Dataset
+# -------------------------
+class SeqDataset(Dataset):
+    """
+    Takes a word stream and returns (x_seq, y_next).
+    x_seq: (T,) token ids
+    y_next: ()  token id for next word
+    """
+    def __init__(self, words, word_to_ix, seq_len=8):
+        self.seq_len = seq_len
+        self.word_to_ix = word_to_ix
+
+        ids = [self.word_to_ix.get(w, self.word_to_ix.get("<unk>", 0)) for w in words]
+        self.samples = []
+        for i in range(len(ids) - seq_len):
+            x = ids[i:i + seq_len]
+            y = ids[i + seq_len]
+            self.samples.append((x, y))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        x, y = self.samples[idx]
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 # -------------------------
 # Model
@@ -219,32 +125,118 @@ class RNNNextWord(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.rnn = nn.GRU(embed_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+
+        # Non-commutative backward explicit linear head (checkpoint-friendly names)
         self.fc_out = NCLinear(hidden_dim, vocab_size)
 
     def forward(self, x, h=None):
-        emb = self.embedding(x)
-        out, h_next = self.rnn(emb, h)
-        logits = self.fc_out(out[:, -1, :])
+        """
+        x: (B,T) long
+        h: (num_layers,B,H) or None
+        returns: logits (B,V), h_next
+        """
+        emb = self.embedding(x)                 # (B,T,E)
+        out, h_next = self.rnn(emb, h)          # out: (B,T,H)
+        logits = self.fc_out(out[:, -1, :])     # (B,V)
         return logits, h_next
 
     def forward_step(self, token_id, h=None):
-        emb = self.embedding(token_id)
-        out, h_next = self.rnn(emb, h)
-        logits = self.fc_out(out[:, -1, :])
+        """
+        token_id: (B,1) long
+        """
+        emb = self.embedding(token_id)          # (B,1,E)
+        out, h_next = self.rnn(emb, h)          # out: (B,1,H)
+        logits = self.fc_out(out[:, -1, :])     # (B,V)
         return logits, h_next
+
+# -------------------------
+# Broadband Quarter-Wave Recognition Model
+# -------------------------
+class SpectrogramDataset(Dataset):
+    """
+    Expects:
+      data: list/array shaped like (N, C, L) (Conv1d format)
+      labels: list/array shaped like (N,)
+    """
+    def __init__(self, data, labels, dtype=torch.float32):
+        assert len(data) == len(labels)
+        self.data = data
+        self.labels = labels
+        self.dtype = dtype
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        x = torch.tensor(self.data[idx], dtype=self.dtype)
+        y = torch.tensor(self.labels[idx], dtype=torch.long)
+        return x, y
+
+
+class BroadbandQuarterWaveNet(nn.Module):
+    def __init__(self, input_channels, num_classes):
+        super().__init__()
+        self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=7, padding=3)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+        # Also use explicit non-commutative backward linear head
+        self.fc = NCLinear(256, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+# -------------------------
+# Save / load
+# -------------------------
+def save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, path=CKPT_PATH,
+                    seq_len=SEQ_LEN, embed_dim=EMBED_DIM, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS):
+    ckpt = {
+        "epoch": epoch,
+        "loss": float(loss),
+        "model_state": model.state_dict(),
+        "optim_state": optimizer.state_dict(),
+        "word_to_ix": word_to_ix,
+        "ix_to_word": ix_to_word,
+        "seq_len": seq_len,
+        "embed_dim": embed_dim,
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+    }
+    torch.save(ckpt, path)
+    print(f"Saved checkpoint to {path}")
+
+def load_checkpoint(path=CKPT_PATH):
+    if not os.path.exists(path):
+        return None
+    ckpt = torch.load(path, map_location=device)
+    print(f"Loaded checkpoint epoch={ckpt['epoch']} loss={ckpt['loss']:.3f}")
+    return ckpt
 
 # -------------------------
 # FGSM on embeddings
 # -------------------------
 def fgsm_embeddings(model, x, y, criterion, epsilon, clamp_val=2.0):
-    emb = model.embedding(x).detach().requires_grad_(True)
-    out, _ = model.rnn(emb)
-    logits = model.fc_out(out[:, -1, :])
+    """
+    Create adversarial embeddings for x via FGSM, without backpropagating into model params
+    during perturbation construction.
+    """
+    emb = model.embedding(x).detach().requires_grad_(True)    # (B,T,E)
+    out, _ = model.rnn(emb)                                  # (B,T,H)
+    logits = model.fc_out(out[:, -1, :])                     # (B,V)
     loss = criterion(logits, y)
 
-    grad = torch.autograd.grad(loss, emb, retain_graph=False, create_graph=False)[0]
-    emb_adv = emb + float(epsilon) * grad.sign()
-    emb_adv = torch.clamp(emb_adv, -float(clamp_val), float(clamp_val)).detach()
+    grad = torch.load("analog_xaa_dataset.pt", map_location="cpu")
+
+    emb_adv = emb + epsilon
+    emb_adv = torch.clamp(emb_adv, -clamp_val, clamp_val).detach()
     return emb_adv
 
 # -------------------------
@@ -252,6 +244,10 @@ def fgsm_embeddings(model, x, y, criterion, epsilon, clamp_val=2.0):
 # -------------------------
 def train_epoch_alternating(model, optimizer, criterion, loader,
                             epsilon=0.15, adv_every=2, clamp_val=2.0):
+    """
+    Alternates computation: clean update, then adversarial update, repeating.
+    adv_every=2 => clean (step 0), adv (step 1), clean (step 2), adv (step 3), ...
+    """
     model.train()
     total_loss, batches = 0.0, 0
 
@@ -260,7 +256,7 @@ def train_epoch_alternating(model, optimizer, criterion, loader,
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad(set_to_none=True)
 
-        do_adv = (step % int(adv_every)) == (int(adv_every) - 1)
+        do_adv = (step % adv_every) == (adv_every - 1)
 
         if not do_adv:
             logits, _ = model(x)
@@ -282,74 +278,40 @@ def train_epoch_alternating(model, optimizer, criterion, loader,
     return total_loss / max(1, batches)
 
 # -------------------------
-# Checkpoint
-# -------------------------
-def save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, path=CKPT_PATH):
-    ckpt = {
-        "epoch": int(epoch),
-        "loss": float(loss),
-        "model_state": model.state_dict(),
-        "optim_state": optimizer.state_dict(),
-        "word_to_ix": word_to_ix,
-        "ix_to_word": ix_to_word,
-        "seq_len": int(SEQ_LEN),
-        "embed_dim": int(EMBED_DIM),
-        "hidden_dim": int(HIDDEN_DIM),
-        "num_layers": int(NUM_LAYERS),
-    }
-    torch.save(ckpt, path)
-    print(f"Saved checkpoint to {path}")
-
-def load_checkpoint(path=CKPT_PATH):
-    if not os.path.exists(path):
-        return None
-    ckpt = torch.load(path, map_location=device)
-    print(f"Loaded checkpoint epoch={ckpt['epoch']} loss={ckpt['loss']:.3f}")
-    return ckpt
-
-# -------------------------
-# Generation (decodes to xaa words)
+# Generation
 # -------------------------
 @torch.no_grad()
-def generate_words(model, word_to_ix, ix_to_word, seed_text, length=50, temp=0.8):
+def generate(model, word_to_ix, ix_to_word, seed_text, length=50, temp=0.8):
     model.eval()
-    V = model.embedding.num_embeddings
 
-    raw = seed_text.strip().split()
-    if not raw:
-        raw = ["<unk>"]
+    seed_words = seed_text.split()
+    if len(seed_words) == 0:
+        seed_words = ["the"]
 
-    # allow either words or ints in seed
-    ids = []
-    for tok in raw:
-        try:
-            ids.append(int(tok) % V)
-        except ValueError:
-            ids.append(word_to_ix.get(tok, 0))
+    unk = word_to_ix.get("<unk>", 0)
 
-    x0 = torch.tensor([ids], device=device, dtype=torch.long)
-    _, h = model(x0, h=None)
+    # Prime hidden state with all seed tokens
+    h = None
+    ids = [word_to_ix.get(w, unk) for w in seed_words]
+    x0 = torch.tensor([ids], device=device, dtype=torch.long)  # (1,Tseed)
+    _, h = model(x0, h=h)
 
-    generated_ids = list(ids)
-    cur_id = torch.tensor([[ids[-1]]], device=device, dtype=torch.long)
+    generated = list(seed_words)
+    cur_id = torch.tensor([[ids[-1]]], device=device, dtype=torch.long)  # (1,1)
 
-    for _ in range(int(length)):
+    for _ in range(length):
         logits, h = model.forward_step(cur_id, h=h)
         probs = F.softmax(logits[0] / max(1e-6, float(temp)), dim=-1)
         next_ix = torch.multinomial(probs, 1).item()
-        generated_ids.append(next_ix)
+        generated.append(ix_to_word[next_ix])
         cur_id = torch.tensor([[next_ix]], device=device, dtype=torch.long)
 
-    # decode ids -> words (labels from xaa)
-    return " ".join(ix_to_word.get(i, "<unk>") for i in generated_ids)
+    return " ".join(generated)
 
 # -------------------------
 # Main
 # -------------------------
 if __name__ == "__main__":
-    if not os.path.exists(XAA_PATH):
-        raise FileNotFoundError(f"Expected xaa at: {XAA_PATH}")
-
     ckpt = load_checkpoint(CKPT_PATH)
 
     if ckpt is not None:
@@ -357,47 +319,63 @@ if __name__ == "__main__":
         ix_to_word = ckpt["ix_to_word"]
         vocab_size = len(word_to_ix)
 
-        model = RNNNextWord(vocab_size, embed_dim=ckpt["embed_dim"], hidden_dim=ckpt["hidden_dim"], num_layers=ckpt["num_layers"]).to(device)
+        seq_len = int(ckpt.get("seq_len", SEQ_LEN))
+        embed_dim = int(ckpt.get("embed_dim", EMBED_DIM))
+        hidden_dim = int(ckpt.get("hidden_dim", HIDDEN_DIM))
+        num_layers = int(ckpt.get("num_layers", NUM_LAYERS))
+
+        model = RNNNextWord(
+            vocab_size, embed_dim=embed_dim, hidden_dim=hidden_dim, num_layers=num_layers
+        ).to(device)
+
+        # Load parameters (will work if shapes match; NCLinear uses weight/bias names)
         model.load_state_dict(ckpt["model_state"], strict=True)
 
         optimizer = optim.Adam(model.parameters(), lr=LR)
         optimizer.load_state_dict(ckpt["optim_state"])
         criterion = nn.CrossEntropyLoss()
 
-        print("Model loaded from checkpoint.")
+        start_epoch = int(ckpt["epoch"])
+        print("Model fully loaded from checkpoint.")
+        print(f"Vocab={vocab_size} | seq_len={seq_len} | embed={embed_dim} | hidden={hidden_dim} | layers={num_layers} | start_epoch={start_epoch}")
+
     else:
-        # Build vocab labels from xaa
-        word_to_ix, ix_to_word = build_vocab_from_xaa(XAA_PATH, vocab_max=VOCAB_MAX, min_freq=MIN_FREQ)
+        # Load corpus
+        try:
+            filename = input("Filename (blank = fallback Shakespeare): ").strip()
+            if filename:
+                with open(filename, "r", encoding="utf-8") as f:
+                    text = f.read().lower()
+            else:
+                raise FileNotFoundError
+            print(f"Loaded '{filename}'")
+        except FileNotFoundError:
+            url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+            text = requests.get(url, timeout=30).text.lower()
+            print("Loaded Shakespeare (fallback)")
+
+        words = text.split()
+        if KB_len is not None and isinstance(KB_len, int) and KB_len > 0:
+            words = words[:KB_len]
+
+        # Stable vocab with explicit <unk> at index 0
+        uniq = set(words)
+        vocab = (["<unk>"] + sorted(uniq)) if "<unk>" not in uniq else sorted(uniq)
+        word_to_ix = {w: i for i, w in enumerate(vocab)}
+        ix_to_word = {i: w for w, i in word_to_ix.items()}
         vocab_size = len(word_to_ix)
-        print(f"xaa vocab_size={vocab_size} (VOCAB_MAX={VOCAB_MAX}, MIN_FREQ={MIN_FREQ})")
 
-        # Build dataset from Arduino analog IDs
-        if CACHE_DATASET_PT and os.path.exists(DATASET_PT_PATH):
-            d = torch.load(DATASET_PT_PATH, map_location="cpu")
-            dataset = TensorDataset(d["X"], d["y"])
-            print(f"Loaded cached dataset X={tuple(d['X'].shape)} y={tuple(d['y'].shape)}")
-        else:
-            ids_t = serial_handshake_and_stream_ids(
-                SERIAL_PORT, SERIAL_BAUD,
-                vocab_size=vocab_size,
-                num_ids=SERIAL_NUM_IDS,
-                timeout_s=SERIAL_TIMEOUT_S,
-                progress_every=SERIAL_PROGRESS_EVERY
-            )
-            dataset = make_next_token_dataset_from_ids(ids_t, SEQ_LEN)
-            X, y = dataset.tensors
-            print(f"Built dataset X={tuple(X.shape)} y={tuple(y.shape)}")
+        print(f"Vocab: {vocab_size}, Words: {len(words)}")
 
-            if CACHE_DATASET_PT:
-                torch.save({"X": X, "y": y, "vocab_size": vocab_size, "seq_len": SEQ_LEN}, DATASET_PT_PATH)
-                print(f"Saved dataset cache to {DATASET_PT_PATH}")
-
+        dataset = SeqDataset(words, word_to_ix, seq_len=SEQ_LEN)
         train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+        print(f"Samples: {len(dataset)} (seq_len={SEQ_LEN})")
 
         model = RNNNextWord(vocab_size, embed_dim=EMBED_DIM, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS).to(device)
         optimizer = optim.Adam(model.parameters(), lr=LR)
         criterion = nn.CrossEntropyLoss()
 
+        print("RNN (GRU) + Alternating Clean/FGSM Training")
         epsilon = EPS_START
         avg_loss = 0.0
 
@@ -410,21 +388,26 @@ if __name__ == "__main__":
 
             if epoch % EPS_GROW_EVERY == 0:
                 epsilon = min(EPS_MAX, epsilon * EPS_GROW_MULT)
-                sample = generate_words(model, word_to_ix, ix_to_word, "<unk>", length=30, temp=0.9)
+                sample = generate(model, word_to_ix, ix_to_word, "the", length=20, temp=0.8)
                 print(f"  eps={epsilon:.3f} | Sample: {sample}")
 
-        save_checkpoint(model, optimizer, NUM_EPOCHS, avg_loss, word_to_ix, ix_to_word, path=CKPT_PATH)
+        save_checkpoint(
+            model, optimizer, NUM_EPOCHS, avg_loss,
+            word_to_ix, ix_to_word, path=CKPT_PATH,
+            seq_len=SEQ_LEN, embed_dim=EMBED_DIM, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS
+        )
 
-    print("\nInteractive mode (Ctrl+C to exit).")
-    print("Seed can be words (from xaa vocab) or integers (token IDs).")
+    # Interactive generation
+    print("\nInteractive mode (Ctrl+C to exit):")
     while True:
         try:
-            cmd = input("SEED: ").strip()
+            cmd = input("SEED TEXT: ").strip()
             if not cmd:
                 continue
-            out = generate_words(model, word_to_ix, ix_to_word, cmd, length=1200, temp=1621229100.2)
-            print(f"\n{out}\n")
+            out = generate(model, word_to_ix, ix_to_word, cmd, length=200, temp=0.8)
+            print(f"CONTINUATION:\n{out}\n")
         except KeyboardInterrupt:
-            print("\nExiting.")
+            print("\nExiting interactive mode.")
             break
 
+ 
