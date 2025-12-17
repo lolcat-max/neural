@@ -1,5 +1,5 @@
-// arduino_analog_id_streamer.ino
-// Analog -> integer token ID streamer.
+// arduino_analog_id_streamer_shift.ino
+// Analog -> integer token ID streamer (bitshift-based).
 //
 // PC -> Arduino (ASCII, newline-terminated):
 //   PING
@@ -18,9 +18,10 @@
 
 const int ANALOG_PIN = A0;
 
-// Typical AVR ADC range is 0..1023 (10-bit). [web:128]
-const long ADC_MIN = 0;
-const long ADC_MAX = 1023;
+// Typical AVR ADC is 10-bit => 0..1023 [web:135][web:145]
+const uint16_t ADC_MIN = 0;
+const uint16_t ADC_MAX = 1023;
+const uint8_t  ADC_BITS = 10;
 
 long V = -1; // vocab size
 long N = -1; // how many ids to output
@@ -32,10 +33,46 @@ String readLine() {
   return s;
 }
 
-long analogToToken(long adcValue, long vocabSize) {
-  // map() remaps but does not constrain; clamp manually. [web:136]
-  long id = map(adcValue, ADC_MIN, ADC_MAX, 0, vocabSize - 1);
-  if (id < 0) id = 0;
+static inline bool isPowerOfTwoU32(uint32_t x) {
+  return x && ((x & (x - 1)) == 0);
+}
+
+static inline uint8_t log2_u32_pow2(uint32_t x) {
+  // x must be power-of-two
+  uint8_t k = 0;
+  while (x >>= 1) k++;
+  return k;
+}
+
+uint32_t analogToTokenShift(uint16_t adcValue, uint32_t vocabSize) {
+  // Clamp ADC into expected range (defensive).
+  if (adcValue < ADC_MIN) adcValue = ADC_MIN;
+  if (adcValue > ADC_MAX) adcValue = ADC_MAX;
+
+  if (vocabSize <= 1) return 0;
+
+  // Fast path: vocab is power-of-two => just take top bits (bitshift quantizer).
+  // Example: V=256 => keep top 8 bits of the 10-bit ADC: id = adc >> 2.
+  if (isPowerOfTwoU32(vocabSize)) {
+    uint8_t k = log2_u32_pow2(vocabSize); // vocabSize == 2^k
+
+    if (k == 0) return 0;
+
+    if (k >= ADC_BITS) {
+      // If V > 1024 (k > 10), upscale ADC into more bits by left shifting
+      // then mask into range [0, V-1].
+      uint8_t lshift = k - ADC_BITS;
+      uint32_t id = ((uint32_t)adcValue) << lshift;
+      return id & (vocabSize - 1);
+    } else {
+      uint8_t rshift = ADC_BITS - k;
+      return ((uint32_t)adcValue) >> rshift;
+    }
+  }
+
+  // General path: scale by multiply + right shift (fixed-point), then clamp.
+  // id ≈ floor(adc * V / 1024), using a >> 10 shift (fast divide by 1024). [web:151]
+  uint32_t id = ((uint32_t)adcValue * (uint32_t)vocabSize) >> ADC_BITS; // >>10
   if (id >= vocabSize) id = vocabSize - 1;
   return id;
 }
@@ -44,7 +81,6 @@ void setup() {
   Serial.begin(115200);
   Serial.setTimeout(2000);
 
-  // Don't hang forever on native USB boards.
   unsigned long t0 = millis();
   while (!Serial && (millis() - t0) < 2000) { }
 
@@ -52,7 +88,6 @@ void setup() {
 }
 
 void loop() {
-  // Repeat READY until configured.
   static unsigned long lastReady = 0;
   if ((V <= 0 || N <= 0) && millis() - lastReady > 500) {
     Serial.println("READY");
@@ -90,8 +125,8 @@ void loop() {
     Serial.println("START");
 
     for (long i = 0; i < N; i++) {
-      long adc = analogRead(ANALOG_PIN);
-      long id  = analogToToken(adc, V);
+      uint16_t adc = (uint16_t)analogRead(ANALOG_PIN);
+      uint32_t id  = analogToTokenShift(adc, (uint32_t)V);
       Serial.println(id);
 
       // If your PC can’t keep up, uncomment:
